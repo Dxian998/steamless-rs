@@ -1,0 +1,668 @@
+use crate::crypto::aes::{AesHelper, AesMode};
+use crate::crypto::xtea::{steam_drmp_pass1, steam_xor};
+use crate::logger::{Level, Logger};
+use crate::options::Options;
+use crate::pe::{Buf, PeFile};
+use crate::variants::common::{self, DRM_FLAG_NO_ENCRYPTION};
+use crate::{Error, Result};
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Variant {
+    V30,
+    V31,
+}
+
+pub(crate) struct Var3xHeader {
+    pub xor_key: u32,
+    pub signature: u32,
+    pub bind_section_offset: u32,
+    pub original_entry_point: u32,
+    pub payload_size: u32,
+    pub drmp_dll_offset: u32,
+    pub drmp_dll_size: u32,
+    pub flags: u32,
+    pub code_section_virtual_address: u64,
+    pub code_section_raw_size: u64,
+    pub aes_key: [u8; 32],
+    pub aes_iv: [u8; 16],
+    pub code_section_stolen_data: [u8; 16],
+    pub encryption_keys: [u32; 4],
+    pub has_tls_callback: u32,
+}
+
+pub(crate) struct State {
+    pub header: Var3xHeader,
+    pub xor_key: u32,
+    pub tls_as_oep: bool,
+    pub tls_oep_rva: u64,
+    pub tls_oep_override: u32,
+    pub code_index: Option<usize>,
+    pub code_section_data: Option<Vec<u8>>,
+}
+
+const X86_VARIANT: &str = "E8 00 00 00 00 50 53 51 52 56 57 55 8B 44 24 1C 2D 05 00 00 00 8B CC 83 E4 F0 51 51 51 50";
+const X64_VARIANT: &str = "E8 00 00 00 00 50 53 51 52 56 57 55 41 50";
+const X86_V30_HEADER_SIZE_PATTERN: &str = "55 8B EC 81 EC ?? ?? ?? ?? 53 ?? ?? ?? ?? ?? 68";
+const X86_V30_HEADER_SIZE_PATTERN_2: &str = "55 8B EC 81 EC ?? ?? ?? ?? 53 ?? ?? ?? ?? ?? 8D 83";
+const X64_HEADER_SIZE_48: &str = "48 8D 91 ?? ?? ?? ?? 48";
+const X64_HEADER_SIZE_41: &str = "48 8D 91 ?? ?? ?? ?? 41";
+const X86_V31_HEADER_SIZE_68: &str = "55 8B EC 81 EC ?? ?? ?? ?? 53 ?? ?? ?? ?? ?? 68";
+const X86_V31_HEADER_SIZE_8D83: &str = "55 8B EC 81 EC ?? ?? ?? ?? 53 ?? ?? ?? ?? ?? 8D 83";
+const X86_V31_HEADER_SIZE_8D: &str = "55 8B EC 81 EC ?? ?? ?? ?? 56 ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? 8D";
+const X64_V31_HEADER_SIZE_C7: &str = "48 C7 84 24 ?? ?? ?? ?? ?? ?? ?? ?? 48";
+const X64_TLS_OEP_KEY_PATTERN: &str = "48 81 EA ?? ?? ?? ?? 8B 12 81 F2";
+const X86_TLS_OEP_KEY_PATTERN: &str = "81 EA ?? ?? ?? ?? 8B 12 81 F2";
+
+fn rd_i32(data: &[u8], off: usize) -> Option<i32> {
+    data.get(off..off + 4).map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+fn rd_u32(data: &[u8], off: usize) -> Result<u32> {
+    data.rd_u32(off).ok_or(Error::OutOfBounds)
+}
+
+fn rd_u64(data: &[u8], off: usize) -> Result<u64> {
+    data.rd_u64(off).ok_or(Error::OutOfBounds)
+}
+
+fn read_array<const N: usize>(data: &[u8], off: usize) -> Result<[u8; N]> {
+    data.rd_bytes(off, N).ok_or(Error::OutOfBounds)?.try_into().map_err(|_| Error::OutOfBounds)
+}
+
+fn parse_header(data: &[u8], variant: Variant) -> Result<Var3xHeader> {
+    Ok(match variant {
+        Variant::V30 => Var3xHeader {
+            xor_key: rd_u32(data, 0)?,
+            signature: rd_u32(data, 4)?,
+            bind_section_offset: rd_u32(data, 20)?,
+            original_entry_point: rd_u32(data, 28)?,
+            payload_size: rd_u32(data, 36)?,
+            drmp_dll_offset: rd_u32(data, 40)?,
+            drmp_dll_size: rd_u32(data, 44)?,
+            flags: rd_u32(data, 52)?,
+            code_section_virtual_address: rd_u32(data, 64)? as u64,
+            code_section_raw_size: rd_u32(data, 68)? as u64,
+            aes_key: read_array(data, 72)?,
+            aes_iv: read_array(data, 104)?,
+            code_section_stolen_data: read_array(data, 120)?,
+            encryption_keys: [
+                rd_u32(data, 136)?,
+                rd_u32(data, 140)?,
+                rd_u32(data, 144)?,
+                rd_u32(data, 148)?,
+            ],
+            has_tls_callback: rd_u32(data, 152)?,
+        },
+        Variant::V31 => Var3xHeader {
+            xor_key: rd_u32(data, 0)?,
+            signature: rd_u32(data, 4)?,
+            bind_section_offset: rd_u32(data, 24)?,
+            original_entry_point: rd_u32(data, 32)? as u32,
+            payload_size: rd_u32(data, 44)?,
+            drmp_dll_offset: rd_u32(data, 48)?,
+            drmp_dll_size: rd_u32(data, 52)?,
+            flags: rd_u32(data, 60)?,
+            code_section_virtual_address: rd_u64(data, 72)?,
+            code_section_raw_size: rd_u64(data, 80)?,
+            aes_key: read_array(data, 88)?,
+            aes_iv: read_array(data, 120)?,
+            code_section_stolen_data: read_array(data, 136)?,
+            encryption_keys: [
+                rd_u32(data, 152)?,
+                rd_u32(data, 156)?,
+                rd_u32(data, 160)?,
+                rd_u32(data, 164)?,
+            ],
+            has_tls_callback: 0,
+        },
+    })
+}
+
+pub(crate) fn expected_size(variant: Variant) -> u32 {
+    match variant {
+        Variant::V30 => 0x00,
+        Variant::V31 => 0xF0,
+    }
+}
+
+pub(crate) fn is_v30_size(size: u32) -> bool {
+    size == 0xB0 || size == 0xD0
+}
+pub(crate) fn get_header_size(pe: &PeFile, variant: Variant, is64: bool) -> Result<u32> {
+    let bind = pe.get_section_data_by_name(".bind").ok_or_else(|| Error::Unpack("bind section data missing".into()))?;
+    let bind = if is64 && variant == Variant::V31 {
+        let n = bind.len().min(0x3000);
+        &bind[..n]
+    } else {
+        bind
+    };
+
+    match (variant, is64) {
+        (Variant::V30, false) => {
+            if crate::pattern::find_pattern(bind, X86_VARIANT).is_err() {
+                return Err(Error::Unpack("v3.0 x86 signature not found".into()));
+            }
+            let (offset, add) =
+                match crate::pattern::find_pattern(bind, X86_V30_HEADER_SIZE_PATTERN) {
+                    Ok(o) => (o, 16usize),
+                    Err(_) => (
+                        crate::pattern::find_pattern(bind, X86_V30_HEADER_SIZE_PATTERN_2).map_err(
+                            |_| Error::Unpack("v3.0 x86 header size pattern not found".into()),
+                        )?,
+                        22usize,
+                    ),
+                };
+            Ok(rd_i32(bind, offset + add).ok_or(Error::OutOfBounds)? as u32)
+        }
+        (Variant::V30, true) => {
+            if crate::pattern::find_pattern(bind, X64_VARIANT).is_err() {
+                return Err(Error::Unpack("v3.0 x64 signature not found".into()));
+            }
+            let offset = crate::pattern::find_pattern(bind, X64_HEADER_SIZE_48).ok()
+                .or_else(|| crate::pattern::find_pattern(bind, X64_HEADER_SIZE_41).ok())
+                .ok_or_else(|| Error::Unpack("v3.0 x64 header size pattern not found".into()))?;
+            Ok(rd_i32(bind, offset + 3).ok_or(Error::OutOfBounds)?.unsigned_abs())
+        }
+        (Variant::V31, false) => {
+            if crate::pattern::find_pattern(bind, X86_VARIANT).is_err() {
+                return Err(Error::Unpack("v3.1 x86 signature not found".into()));
+            }
+            for (pat, add) in [
+                (X86_V31_HEADER_SIZE_68, 0x10),
+                (X86_V31_HEADER_SIZE_8D83, 0x16),
+                (X86_V31_HEADER_SIZE_8D, 0x10),
+            ] {
+                if let Ok(offset) = crate::pattern::find_pattern(bind, pat) {
+                    return Ok(rd_i32(bind, offset + add).ok_or(Error::OutOfBounds)? as u32);
+                }
+            }
+            Err(Error::Unpack("v3.1 x86 version pattern not found".into()))
+        }
+        (Variant::V31, true) => {
+            if crate::pattern::find_pattern(bind, X64_VARIANT).is_err() {
+                return Err(Error::Unpack("v3.1 x64 signature not found".into()));
+            }
+            let offset = crate::pattern::find_pattern(bind, X64_HEADER_SIZE_48)
+                .ok()
+                .or_else(|| crate::pattern::find_pattern(bind, X64_HEADER_SIZE_41).ok())
+                .map(Ok::<_, Error>)
+                .unwrap_or_else(|| {
+                    crate::pattern::find_pattern(bind, X64_V31_HEADER_SIZE_C7)
+                        .map(|o| o + usize::from(o > 0) * 5)
+                        .map_err(|_| Error::Unpack("v3.1 x64 header size pattern not found".into()))
+                })?;
+            Ok(rd_i32(bind, offset + 3)
+                .ok_or(Error::OutOfBounds)?
+                .unsigned_abs())
+        }
+    }
+}
+
+fn validates_code_section(variant: Variant, is64: bool) -> bool {
+    !(variant == Variant::V31 && is64)
+}
+
+pub(crate) fn step1(pe: &mut PeFile, variant: Variant, is64: bool) -> Result<State> {
+    let header_size = if variant == Variant::V30 {
+        get_header_size(pe, variant, is64)?
+    } else {
+        0xF0
+    };
+
+    let read_header = |f: &PeFile, file_offset: u64| -> Result<(Vec<u8>, u32, Var3xHeader)> {
+        let start = file_offset
+            .checked_sub(header_size as u64)
+            .ok_or_else(|| Error::Unpack("header extends below the file start".into()))?;
+        let mut data = common::read_range(f, start, header_size as usize)?;
+        let xor_key = steam_xor(&mut data, header_size, 0);
+        let header = parse_header(&data, variant)?;
+        Ok((data, xor_key, header))
+    };
+
+    let expected = match variant {
+        Variant::V30 => 0xC0DEC0DE,
+        Variant::V31 => 0xC0DEC0DF,
+    };
+
+    let ep_off = pe.get_file_offset_from_rva(pe.optional.address_of_entry_point as u64);
+    if let Ok((_, xor_key, header)) = read_header(pe, ep_off) {
+        if header.signature == expected {
+            return Ok(State {
+                header,
+                xor_key,
+                tls_as_oep: false,
+                tls_oep_rva: 0,
+                tls_oep_override: 0,
+                code_index: None,
+                code_section_data: None,
+            });
+        }
+    }
+
+    if let Some(&first_callback) = pe.tls_callbacks.first() {
+        let tls_file_off = pe.get_file_offset_from_rva(pe.get_rva_from_va(first_callback));
+        if let Ok((_, xor_key, header)) = read_header(pe, tls_file_off) {
+            let matches_sig = header.signature == expected;
+            if matches_sig {
+                let tls_oep_rva = pe.get_rva_from_va(first_callback);
+                let mut tls_oep_override = 0u32;
+
+                let should_rebuild = match variant {
+                    Variant::V30 => header.has_tls_callback == 1 && first_callback != 0,
+                    Variant::V31 => first_callback != 0,
+                };
+                if should_rebuild {
+                    if let Ok(override_oep) = rebuild_tls_callback_information(pe, &header, is64) {
+                        tls_oep_override = override_oep;
+                    }
+                }
+
+                return Ok(State {
+                    header,
+                    xor_key,
+                    tls_as_oep: true,
+                    tls_oep_rva,
+                    tls_oep_override,
+                    code_index: None,
+                    code_section_data: None,
+                });
+            }
+        }
+    }
+
+    if let Some(bind_data) = pe.get_section_data_by_name(".bind") {
+        let h_size = header_size as usize;
+        if bind_data.len() >= h_size {
+            for offset in (0..=bind_data.len() - h_size).step_by(4) {
+                let mut chunk = bind_data[offset..offset + h_size].to_vec();
+                let xor_key = steam_xor(&mut chunk, header_size, 0);
+                if let Ok(header) = parse_header(&chunk, variant) {
+                    if header.signature == expected {
+                        return Ok(State {
+                            header,
+                            xor_key,
+                            tls_as_oep: false,
+                            tls_oep_rva: 0,
+                            tls_oep_override: 0,
+                            code_index: None,
+                            code_section_data: None,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    Err(Error::Unpack("header signature mismatch".into()))
+}
+
+fn rebuild_tls_callback_information(pe: &mut PeFile, header: &Var3xHeader, is64: bool) -> Result<u32> {
+    let first_callback = pe
+        .tls_callbacks
+        .first()
+        .copied()
+        .ok_or_else(|| Error::Unpack("missing TLS callback".into()))?;
+    let section = pe
+        .get_owner_section(pe.get_rva_from_va(first_callback))
+        .ok_or_else(|| Error::Unpack("TLS callback outside of any section".into()))?;
+    if !section.is_valid() || !section.name_str().eq_ignore_ascii_case(".bind") {
+        return Err(Error::Unpack(
+            "TLS callback is not within the .bind section".into(),
+        ));
+    }
+    let tlsd = pe
+        .tls_directory
+        .ok_or_else(|| Error::Unpack("missing TLS directory".into()))?;
+    let callback_rva = pe.get_rva_from_va(tlsd.address_of_callbacks);
+    let mut addr = pe.get_file_offset_from_rva(callback_rva);
+    let tlsd_section = pe
+        .get_owner_section(callback_rva)
+        .ok_or_else(|| Error::Unpack("TLS directory outside of any section".into()))?;
+    if !tlsd_section.is_valid() {
+        return Err(Error::Unpack("TLS directory section is invalid".into()));
+    }
+
+    addr -= tlsd_section.pointer_to_raw_data as u64;
+    let tlsd_index = pe
+        .section_index_of(tlsd_section)
+        .ok_or_else(|| Error::Unpack("TLS directory section not found".into()))?;
+    let callback_bytes: Vec<u8> = if is64 {
+        (pe.optional.image_base + header.original_entry_point as u64)
+            .to_le_bytes()
+            .to_vec()
+    } else {
+        ((pe.optional.image_base as u32).wrapping_add(header.original_entry_point))
+            .to_le_bytes()
+            .to_vec()
+    };
+
+    let start = addr as usize;
+    let end = start
+        .checked_add(callback_bytes.len())
+        .ok_or(Error::OutOfBounds)?;
+    let section_data = pe
+        .section_data
+        .get_mut(tlsd_index)
+        .ok_or(Error::OutOfBounds)?;
+    if end > section_data.len() {
+        return Err(Error::OutOfBounds);
+    }
+    section_data[start..end].copy_from_slice(&callback_bytes);
+    let entry = pe.get_file_offset_from_rva(pe.optional.address_of_entry_point as u64);
+    let take = 0x100usize;
+    let data = pe
+        .data
+        .get(entry as usize..)
+        .map(|d| &d[..d.len().min(take)])
+        .ok_or(Error::OutOfBounds)?;
+    let (pat, val_off) = if is64 {
+        (X64_TLS_OEP_KEY_PATTERN, 0x0B)
+    } else {
+        (X86_TLS_OEP_KEY_PATTERN, 0x0A)
+    };
+
+    let res = crate::pattern::find_pattern(data, pat)?;
+
+    let intv = i32::from_le_bytes(
+        data.get(res + val_off..res + val_off + 4)
+            .ok_or(Error::OutOfBounds)?
+            .try_into()
+            .map_err(|_| Error::OutOfBounds)?,
+    );
+
+    let key = ((header.xor_key as u64 as i64) ^ (intv as i64)) as u64;
+    let off = pe
+        .optional
+        .image_base
+        .wrapping_add(pe.optional.address_of_entry_point as u64)
+        .wrapping_add(key);
+
+    Ok(off.wrapping_sub(pe.optional.image_base) as u32)
+}
+
+pub(crate) fn step2(pe: &PeFile, options: &Options, state: &mut State, logger: &dyn Logger) -> Result<()> {
+    let payload_addr = pe.get_file_offset_from_rva(payload_base_rva(state, pe));
+    let payload_size = (state.header.payload_size.wrapping_add(0x0F)) & 0xFFFF_FFF0;
+
+    if payload_size == 0 {
+        return Ok(());
+    }
+
+    logger.log(Level::Debug, " --> File has payload data!");
+
+    let mut payload = common::read_range(pe, payload_addr, payload_size as usize)?;
+    state.xor_key = steam_xor(&mut payload, payload_size, state.xor_key);
+
+    if options.dump_payload_to_disk {
+        common::maybe_dump_payload(pe, options, &payload);
+        logger.log(Level::Debug, " --> Saved payload to disk!");
+    }
+
+    Ok(())
+}
+
+pub(crate) fn step3(pe: &PeFile, options: &Options, state: &State, logger: &dyn Logger) -> Result<()> {
+    if state.header.drmp_dll_size == 0 {
+        logger.log(
+            Level::Debug,
+            " --> File does not contain a SteamDRMP.dll file.",
+        );
+        return Ok(());
+    }
+
+    logger.log(Level::Debug, " --> File has SteamDRMP.dll file!");
+
+    let drmp_addr = pe.get_file_offset_from_rva(
+        payload_base_rva(state, pe).wrapping_add(state.header.drmp_dll_offset as u64),
+    );
+    let mut drmp_data = common::read_range(pe, drmp_addr, state.header.drmp_dll_size as usize)?;
+
+    steam_drmp_pass1(
+        &mut drmp_data,
+        state.header.drmp_dll_size,
+        &state.header.encryption_keys,
+    );
+
+    if options.dump_steam_drmp_to_disk {
+        common::maybe_dump_drmp(pe, options, &drmp_data);
+        logger.log(Level::Debug, " --> Saved SteamDRMP.dll to disk!");
+    }
+
+    Ok(())
+}
+
+pub(crate) fn step4(pe: &mut PeFile, options: &Options, state: &mut State, variant: Variant, is64: bool, logger: &dyn Logger) -> Result<()> {
+    if common::remove_bind_section(pe, options)? {
+        logger.log(
+            Level::Debug,
+            " --> .bind section was removed from the file.",
+        );
+    } else {
+        logger.log(Level::Debug, " --> .bind section was kept in the file.");
+    }
+
+    if (state.header.flags & DRM_FLAG_NO_ENCRYPTION) != 0 {
+        return Ok(());
+    }
+
+    let code_section = pe
+        .get_owner_section(state.header.code_section_virtual_address)
+        .ok_or_else(|| Error::Unpack("code section not found".into()))?;
+    if validates_code_section(variant, is64)
+        && (code_section.pointer_to_raw_data == 0 || code_section.size_of_raw_data == 0)
+    {
+        return Err(Error::Unpack("code section is invalid".into()));
+    }
+
+    state.code_index = pe.section_index_of(code_section);
+    Ok(())
+}
+
+pub(crate) fn step5(pe: &mut PeFile, state: &mut State, variant: Variant, is64: bool, logger: &dyn Logger) -> Result<()> {
+    if (state.header.flags & DRM_FLAG_NO_ENCRYPTION) != 0 {
+        logger.log(Level::Debug, " --> Code section is not encrypted.");
+        return Ok(());
+    }
+
+    let code_index = state
+        .code_index
+        .ok_or_else(|| Error::Unpack("code section not found".into()))?;
+    let code_section = pe.sections[code_index];
+    logger.log(
+        Level::Debug,
+        &format!(
+            " --> {} linked as main code section.",
+            code_section.name_str()
+        ),
+    );
+    logger.log(
+        Level::Debug,
+        &format!(" --> {} section is encrypted.", code_section.name_str()),
+    );
+
+    if variant == Variant::V31 && is64 && code_section.size_of_raw_data == 0 {
+        logger.log(
+            Level::Debug,
+            &format!(
+                " --> {} section is empty; skipping decryption.",
+                code_section.name_str()
+            ),
+        );
+        state.code_section_data = Some(Vec::new());
+        return Ok(());
+    }
+
+    let code_len = if variant == Variant::V31 && !is64 {
+        state.header.code_section_raw_size as usize
+    } else {
+        code_section.size_of_raw_data as usize
+    };
+
+    let section_offset = pe.get_file_offset_from_rva(code_section.virtual_address as u64);
+    let mut merged = state.header.code_section_stolen_data.to_vec();
+    merged.extend(common::read_range(pe, section_offset, code_len)?);
+    let mut aes = AesHelper::new(&state.header.aes_key, &state.header.aes_iv);
+    aes.rebuild_iv(Some(&state.header.aes_iv));
+    let data = aes.decrypt(&merged, AesMode::Cbc);
+
+    if variant == Variant::V31 && !is64 {
+        let n = (state.header.code_section_raw_size as usize)
+            .min(data.len())
+            .min(pe.section_data[code_index].len());
+        pe.section_data[code_index][..n].copy_from_slice(&data[..n]);
+    } else {
+        state.code_section_data = Some(data);
+    }
+
+    Ok(())
+}
+
+pub(crate) fn step6(pe: &mut PeFile, options: &Options, state: &State, _variant: Variant, _is64: bool) -> Result<std::path::PathBuf> {
+    let entry_point = if state.tls_oep_override > 0 {
+        state.tls_oep_override
+    } else {
+        state.header.original_entry_point
+    };
+
+    match (&state.code_section_data, state.code_index) {
+        (Some(data), Some(index)) => {
+            common::save_full(pe, options, entry_point, Some((index, data.as_slice())))
+        }
+        _ => common::save_full(pe, options, entry_point, None),
+    }
+}
+
+fn payload_base_rva(state: &State, pe: &PeFile) -> u64 {
+    let bind_offset = state.header.bind_section_offset as u64;
+    if state.tls_as_oep {
+        state.tls_oep_rva.wrapping_sub(bind_offset)
+    } else {
+        (pe.optional.address_of_entry_point as u64).wrapping_sub(bind_offset)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn build_v30_header() -> Vec<u8> {
+        let mut h = vec![0u8; 0xD0];
+        h[0..4].copy_from_slice(&0x1122_3344u32.to_le_bytes()); // xor key
+        h[4..8].copy_from_slice(&0xC0DEC0DEu32.to_le_bytes()); // signature
+        h[8..16].copy_from_slice(&0x400000u64.to_le_bytes()); // image base
+        h[16..20].copy_from_slice(&0x1000u32.to_le_bytes()); // AEP
+        h[20..24].copy_from_slice(&0x1000u32.to_le_bytes()); // bind section offset
+        h[28..32].copy_from_slice(&0x1234u32.to_le_bytes()); // OEP
+        h[36..40].copy_from_slice(&0u32.to_le_bytes()); // payload size
+        h[40..44].copy_from_slice(&0x400u32.to_le_bytes()); // drmp offset
+        h[44..48].copy_from_slice(&0u32.to_le_bytes()); // drmp size
+        h[52..56].copy_from_slice(&0u32.to_le_bytes()); // flags
+        h[64..68].copy_from_slice(&0x1000u32.to_le_bytes()); // code section va
+        h[72..104].fill(0x01); // aes key
+        h[104..120].fill(0x02); // aes iv
+        h[120..136].fill(0x03); // stolen
+        h[136..152].fill(0x04); // encryption keys
+        h[152..156].copy_from_slice(&1u32.to_le_bytes()); // has_tls_callback
+        h
+    }
+
+    #[test]
+    fn parses_v30_header() {
+        let h = parse_header(&build_v30_header(), Variant::V30).unwrap();
+        assert_eq!(h.signature, 0xC0DEC0DE);
+        assert_eq!(h.code_section_virtual_address, 0x1000);
+        assert_eq!(h.original_entry_point, 0x1234);
+        assert_eq!(h.aes_key, [0x01; 32]);
+        assert_eq!(h.aes_iv, [0x02; 16]);
+        assert_eq!(h.code_section_stolen_data, [0x03; 16]);
+        assert_eq!(h.encryption_keys, [0x0404_0404; 4]);
+        assert_eq!(h.has_tls_callback, 1);
+    }
+
+    #[test]
+    fn parses_v31_header() {
+        let mut h_bytes = vec![0u8; 0xF0];
+        h_bytes[0..4].copy_from_slice(&0x1122_3344u32.to_le_bytes());
+        h_bytes[4..8].copy_from_slice(&0xC0DEC0DFu32.to_le_bytes());
+        h_bytes[24..28].copy_from_slice(&0x2000u32.to_le_bytes());
+        h_bytes[32..36].copy_from_slice(&0x5678u32.to_le_bytes());
+        h_bytes[72..80].copy_from_slice(&0x1000u64.to_le_bytes());
+        h_bytes[80..88].copy_from_slice(&0x4000u64.to_le_bytes());
+        h_bytes[88..120].fill(0xAA); // aes_key
+        h_bytes[120..136].fill(0xBB); // aes_iv
+        h_bytes[136..152].fill(0xCC); // code_section_stolen_data
+        h_bytes[152..168].fill(0xDD); // encryption_keys
+
+        let h = parse_header(&h_bytes, Variant::V31).unwrap();
+        assert_eq!(h.signature, 0xC0DEC0DF);
+        assert_eq!(h.original_entry_point, 0x5678);
+        assert_eq!(h.code_section_virtual_address, 0x1000);
+        assert_eq!(h.code_section_raw_size, 0x4000);
+        assert_eq!(h.aes_key, [0xAA; 32]);
+        assert_eq!(h.aes_iv, [0xBB; 16]);
+        assert_eq!(h.code_section_stolen_data, [0xCC; 16]);
+        assert_eq!(h.encryption_keys, [0xDDDD_DDDD; 4]);
+    }
+
+    #[test]
+    fn v30_header_sizes_are_known() {
+        assert!(is_v30_size(0xB0));
+        assert!(is_v30_size(0xD0));
+        assert!(!is_v30_size(0xF0));
+    }
+
+    #[test]
+    fn scan_bind_section_fallback_finds_header() {
+        let raw_hdr = build_v30_header();
+        let mut enc_hdr = raw_hdr.clone();
+        let mut key = u32::from_le_bytes(enc_hdr[0..4].try_into().unwrap());
+        for chunk in enc_hdr[4..].chunks_exact_mut(4) {
+            let p = u32::from_le_bytes(chunk.try_into().unwrap());
+            let c = p ^ key;
+            chunk.copy_from_slice(&c.to_le_bytes());
+            key = c;
+        }
+
+        let mut bind_bytes = vec![
+            0xE8, 0x00, 0x00, 0x00, 0x00, 0x50, 0x53, 0x51, 0x52, 0x56, 0x57, 0x55, 0x8B, 0x44,
+            0x24, 0x1C, 0x2D, 0x05, 0x00, 0x00, 0x00, 0x8B, 0xCC, 0x83, 0xE4, 0xF0, 0x51, 0x51,
+            0x51, 0x50, 0x90, 0x90, // 32 bytes so far
+            0x55, 0x8B, 0xEC, 0x81, 0xEC, 0x00, 0x01, 0x00, 0x00, 0x53, 0x90, 0x90, 0x90, 0x90,
+            0x90, 0x68, 0xD0, 0x00, 0x00, 0x00, // 32 + 20 = 52 bytes (multiple of 4)
+        ];
+        bind_bytes.extend_from_slice(&[0x90; 64]);
+        bind_bytes.extend_from_slice(&enc_hdr);
+        bind_bytes.extend_from_slice(&[0x90; 64]);
+
+        let bind_size = bind_bytes.len() as u32;
+        let bind_raw = 0x400u32;
+        let bind_rva = 0x2000u32;
+
+        let mut file = vec![0u8; 0x1000];
+        file[0] = b'M';
+        file[1] = b'Z';
+        file.wr_u32(0x3C, 0x100);
+        file[0x100..0x104].copy_from_slice(b"PE\0\0");
+        file.wr_u16(0x104, 0x014C);
+        file.wr_u16(0x106, 1);
+        file.wr_u16(0x114, 0xE0);
+        file.wr_u16(0x118, 0x10B);
+        file.wr_u32(0x128, 0x5000);
+        file.wr_u32(0x138, 0x1000);
+        file.wr_u32(0x13C, 0x200);
+
+        let sections = 0x118 + 0xE0;
+        file[sections..sections + 8].copy_from_slice(b".bind\0\0\0");
+        file.wr_u32(sections + 8, bind_size);
+        file.wr_u32(sections + 12, bind_rva);
+        file.wr_u32(sections + 16, bind_size);
+        file.wr_u32(sections + 20, bind_raw);
+
+        file[bind_raw as usize..bind_raw as usize + bind_bytes.len()].copy_from_slice(&bind_bytes);
+
+        let mut pe = PeFile::from_bytes(file, std::path::PathBuf::from("dummy.exe")).unwrap();
+        let state = step1(&mut pe, Variant::V30, false).unwrap();
+        assert_eq!(state.header.signature, 0xC0DEC0DE);
+        assert_eq!(state.header.original_entry_point, 0x1234);
+    }
+}

@@ -1,0 +1,20 @@
+[package]
+name = "steamless-rs"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "CC-BY-NC-ND-4.0"
+description = "Core library for SteamStub DRM unpacking in Rust."
+
+[lib]
+name = "steamless_rs"
+path = "src/lib.rs"
+
+[dependencies]
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
+cipher = "0.4"
+iced-x86 = "1.21"
+serde = { version = "1", features = ["derive"] }
+anyhow = "1"
+thiserror = "2"
