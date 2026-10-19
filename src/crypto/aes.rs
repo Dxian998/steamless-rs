@@ -1,6 +1,5 @@
 use aes::Aes256;
-use cipher::generic_array::GenericArray;
-use cipher::{BlockDecrypt, KeyInit};
+use cipher::{Array, BlockCipherDecrypt, KeyInit};
 
 pub const BLOCK_SIZE: usize = 16;
 
@@ -19,8 +18,8 @@ fn iv_from(v: &[u8]) -> [u8; 16] {
 }
 
 fn decrypt_block(key: &[u8; 32], block: &[u8]) -> [u8; 16] {
-    let cipher = Aes256::new(GenericArray::from_slice(key));
-    let mut buf = GenericArray::clone_from_slice(&block[..BLOCK_SIZE]);
+    let cipher = Aes256::new(key.into());
+    let mut buf = Array::from(*<&[u8; 16]>::try_from(&block[..BLOCK_SIZE]).unwrap());
     cipher.decrypt_block(&mut buf);
     buf.into()
 }

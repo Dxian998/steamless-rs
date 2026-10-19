@@ -11,8 +11,8 @@ name = "steamless_rs"
 path = "src/lib.rs"
 
 [dependencies]
-aes = "0.8"
-cipher = "0.4"
+aes = "0.9"
+cipher = "0.5"
 iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder"] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
