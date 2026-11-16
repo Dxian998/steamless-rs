@@ -13,6 +13,6 @@ path = "src/lib.rs"
 [dependencies]
 aes = "0.9"
 cipher = "0.5"
-iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder"] }
+iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder", "no_d3now", "no_evex", "no_vex", "no_xop"] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
